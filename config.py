@@ -11,7 +11,7 @@ class Config:
     """Configuración base de la aplicación"""
     
     # Configuración básica
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'omar_industrial_ai_2024')
+    SECRET_KEY = os.environ.get('CLAVE API DE OPENAI', 'omar_industrial_ai_2024')
     FLASK_ENV = os.environ.get('FLASK_ENV', 'production')
     DEBUG = FLASK_ENV == 'development'
     
