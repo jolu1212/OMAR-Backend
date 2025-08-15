@@ -41,10 +41,14 @@ class Config:
     
     @classmethod
     def validate(cls) -> bool:
-        """Valida que la configuración sea correcta"""
+        """Valida que la configuración sea correcta y muestra la API key parcialmente"""
         if not cls.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY es requerida")
-        
+
+        # Mostrar la API key parcialmente para verificar que está cargada
+        masked_key = cls.OPENAI_API_KEY[:4] + "..." + cls.OPENAI_API_KEY[-4:]
+        print(f"[DEBUG] OPENAI_API_KEY detectada: {masked_key}")
+
         if cls.OPENAI_TEMPERATURE < 0 or cls.OPENAI_TEMPERATURE > 2:
             raise ValueError("OPENAI_TEMPERATURE debe estar entre 0 y 2")
         
@@ -52,6 +56,7 @@ class Config:
             raise ValueError("OPENAI_MAX_TOKENS debe estar entre 1 y 4000")
         
         return True
+
 
 class DevelopmentConfig(Config):
     """Configuración para desarrollo"""
@@ -71,6 +76,7 @@ class TestingConfig(Config):
     DEBUG = True
     TESTING = True
     LOG_LEVEL = 'DEBUG'
+
 
 # Configuración por defecto
 config = {
