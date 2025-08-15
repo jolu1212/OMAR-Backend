@@ -117,7 +117,7 @@ def ask():
 
         session_data = get_or_create_session(session_id)
         if apply_rate_limit(session_data):
-            return jsonify({"respuesta": "Consulta muy rápida", "imagenes": [], "error": None}), 429
+            return jsonify({"respuesta": "", "imagenes": [], "error": "Consulta muy rápida"}), 429
 
         messages = build_messages(session_data, pregunta)
 
@@ -142,10 +142,10 @@ def ask():
                 answer = (resp["choices"][0]["message"]["content"] or "").strip()
         except (APITimeoutError, APIConnectionError) as e:
             logger.warning(f"Timeout/Conn OpenAI: {e}")
-            return jsonify({"respuesta": "La IA tardó demasiado en responder", "imagenes": [], "error": "timeout"}), 504
+            return jsonify({"respuesta": "", "imagenes": [], "error": "La IA tardó demasiado en responder"}), 504
         except RateLimitError as e:
             logger.warning(f"RateLimit: {e}")
-            return jsonify({"respuesta": "La IA está ocupada", "imagenes": [], "error": "rate_limit"}), 429
+            return jsonify({"respuesta": "", "imagenes": [], "error": "La IA está ocupada"}), 429
 
         now = datetime.now()
         if now > session_data['greet_until']:
@@ -160,9 +160,142 @@ def ask():
         logger.exception("Error /ask")
         return jsonify({"respuesta": "", "imagenes": [], "error": str(e)}), 500
 
-# Ejemplo de entrenamiento texto
+# Endpoint de entrenamiento de texto
 @app.route("/train/text", methods=["POST", "OPTIONS"])
 def train_text():
     if request.method == "OPTIONS":
         return ("", 204)
-    t
+    try:
+        data = request.get_json(silent=True) or {}
+        nota = (data.get("nota") or "").strip()
+        
+        if not nota:
+            return jsonify({"status": "error", "message": "Nota requerida"}), 400
+        
+        # Aquí procesarías la nota para entrenar el modelo
+        # Por ahora solo confirmamos recepción
+        logger.info(f"Entrenamiento de texto recibido: {nota[:100]}...")
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Texto recibido para entrenamiento",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.exception("Error /train/text")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Endpoint de entrenamiento de imagen
+@app.route("/train/image", methods=["POST", "OPTIONS"])
+def train_image():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        # Verificar si hay archivo
+        if 'imagen' not in request.files:
+            return jsonify({"status": "error", "message": "No se recibió imagen"}), 400
+        
+        file = request.files['imagen']
+        if file.filename == '':
+            return jsonify({"status": "error", "message": "Nombre de archivo vacío"}), 400
+        
+        # Aquí procesarías la imagen para entrenar el modelo
+        # Por ahora solo confirmamos recepción
+        logger.info(f"Entrenamiento de imagen recibido: {file.filename}")
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Imagen recibida para entrenamiento",
+            "filename": file.filename,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.exception("Error /train/image")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Endpoint de entrenamiento de audio
+@app.route("/train/audio", methods=["POST", "OPTIONS"])
+def train_audio():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        # Verificar si hay archivo
+        if 'audio' not in request.files:
+            return jsonify({"status": "error", "message": "No se recibió audio"}), 400
+        
+        file = request.files['audio']
+        if file.filename == '':
+            return jsonify({"status": "error", "message": "Nombre de archivo vacío"}), 400
+        
+        # Aquí procesarías el audio para entrenar el modelo
+        # Por ahora solo confirmamos recepción
+        logger.info(f"Entrenamiento de audio recibido: {file.filename}")
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Audio recibido para entrenamiento",
+            "filename": file.filename,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.exception("Error /train/audio")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Endpoint de feedback
+@app.route("/feedback", methods=["POST", "OPTIONS"])
+def feedback():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        data = request.get_json(silent=True) or {}
+        session_id = (data.get("sessionId") or "").strip()
+        feedback_text = (data.get("feedback") or "").strip()
+        rating = data.get("rating", 0)
+        
+        if not session_id:
+            return jsonify({"status": "error", "message": "SessionId requerido"}), 400
+        
+        # Aquí procesarías el feedback
+        logger.info(f"Feedback recibido - Session: {session_id}, Rating: {rating}, Text: {feedback_text[:100]}...")
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Feedback recibido",
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.exception("Error /feedback")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Endpoint de estado del sistema
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "sessions_active": len(sessions),
+        "model": MODEL,
+        "openai_configured": bool(OPENAI_API_KEY)
+    })
+
+# Endpoint raíz
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "message": "OMAR Backend - IA Industrial",
+        "version": "1.0.0",
+        "endpoints": [
+            "/ask - Chat con IA",
+            "/train/text - Entrenamiento de texto",
+            "/train/image - Entrenamiento de imagen", 
+            "/train/audio - Entrenamiento de audio",
+            "/feedback - Feedback del usuario",
+            "/status - Estado del sistema",
+            "/ping - Health check"
+        ],
+        "timestamp": datetime.now().isoformat()
+    })
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
