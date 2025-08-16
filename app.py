@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Servidor Flask para IA Industrial OMAR
-Mantiene 100% compatibilidad con la app Android existente
+Mantiene 100% compatibilidade con la app Android existente
 """
 
 import os
