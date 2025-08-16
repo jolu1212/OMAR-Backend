@@ -1,301 +1,205 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+OMAR Backend - IA Industrial
+- Endpoints:
+  /ping   : healthcheck
+  /status : listado de endpoints y versión
+  /ask    : chat con IA (memoria corta por sesión, ahorro de tokens, short-circuits)
+  /reset  : reinicia memoria de sesión
+"""
 
-import os
-import logging
+import os, re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import deque
-from typing import Dict, List
-
-# --- OpenAI ---
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY no está configurada")
-
-_openai_client = None
-_use_openai_legacy = False
-try:
-    from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
-    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-except Exception:
-    import openai
-    from openai.error import APIConnectionError, Timeout as APITimeoutError, RateLimitError
-    openai.api_key = OPENAI_API_KEY
-    _use_openai_legacy = True
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
+from openai import OpenAI
 
-# Configuración de logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("OMAR-Backend")
+from config import get_config
 
+# === Cargar config ===
+Conf = get_config()
+TZ = ZoneInfo(os.environ.get("OMAR_TZ", "America/Santiago"))
+
+# === Sistema y tono ===
+SYSTEM_PROMPT = (
+    "Eres un compañero de trabajo cercano, claro y práctico. "
+    "Respondes en español de Chile, en 1–3 oraciones y directo al grano. "
+    f"Habla solo de {Conf.OMAR_DOMINIO}. "
+    "Si la pregunta no corresponde, responde: 'No tengo esa info.'"
+)
+SALUDO_INICIAL = "Hola, soy tu compañero de trabajo. ¿En qué puedo ayudarte?"
+
+# === Inicialización Flask / OpenAI ===
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'omar_industrial_ai_2024')
-app.url_map.strict_slashes = False
-CORS(app, resources={r"/*": {"origins": "*"}})
+app.config.from_object(Conf)
+CORS(app, resources={r"/*": {"origins": Conf.CORS_ORIGINS}})
+client = OpenAI(api_key=Conf.OPENAI_API_KEY)
 
-# Configuración
-MODEL = "gpt-4o-mini"
-MAX_TOKENS_OUT = 500
-TEMPERATURE = 0.3
-OPENAI_TIMEOUT = float(os.environ.get("OPENAI_TIMEOUT", "30.0"))
-GREETING_TTL_MIN = 30
-MAX_SESSION_TURNS = 10
+# === Memoria en RAM por sesión ===
+# sessions[key] = {
+#   "greet_until": datetime,
+#   "summary": str,
+#   "turns": [{"u": str, "a": str}],
+#   "last_seen": datetime,
+#   "rate": deque(datetime)
+# }
+sessions = {}
 
-SALUDO_INICIAL = """Hola, soy OMAR, tu compañero de trabajo inteligente. 
+# === Utilidades ===
+def ahora_str() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-He sido entrenado con la experiencia de operadores y mantenedores expertos de esta planta. Puedo ayudarte con:
+def sanea(txt: str) -> str:
+    if not txt:
+        return ""
+    t = txt.strip()
+    t = re.sub(r"[\x00-\x1F\x7F]", " ", t)
+    return t
 
-🔧 Diagnóstico de fallas comunes
-📚 Procedimientos operativos
-⚡ Soluciones rápidas basadas en casos anteriores
-🎯 Mantenimiento preventivo
+def es_solo_saludo(p: str) -> bool:
+    return re.fullmatch(r"\s*(hola+|buen[oa]s|qué tal|que tal|hey)\W*\s*", p, re.I) is not None
 
-¿En qué puedo ayudarte hoy?"""
+def es_fecha_hora(p: str) -> bool:
+    return re.search(r"(fecha|qué\s*d[ií]a|que\s*d[ií]a|día\s*de\s*hoy|hora|qué\s*hora|que\s*hora)", p, re.I) is not None
 
-sessions: Dict[str, Dict] = {}
+def fuera_de_dominio(p: str) -> bool:
+    prohibidos = [
+        r"\b(clima|pel[ií]cula|celebridad|f[úu]tbol|pol[ií]tica|hor[óo]scopo|receta)\b",
+        r"\b(chatgpt|openai api key|programaci[óo]n gen[ée]rica)\b"
+    ]
+    return any(re.search(pat, p, re.I) for pat in prohibidos)
 
-def get_or_create_session(session_id: str) -> Dict:
-    if session_id not in sessions:
-        sessions[session_id] = {
-            'turns': deque(maxlen=MAX_SESSION_TURNS),
-            'summary': '',
-            'greet_until': datetime.now() + timedelta(minutes=GREETING_TTL_MIN),
-            'machine_context': None,
-            'last_interaction': datetime.now()
-        }
-    return sessions[session_id]
+def key_sesion(session_id: str | None) -> str:
+    if session_id:
+        return f"sid:{session_id}"
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr) or "0.0.0.0").split(",")[0].strip()
+    return f"ip:{ip}"
 
-def build_messages(session_data: Dict, user_question: str) -> List[Dict]:
-    messages = [{
-        "role": "system",
-        "content": f"""Eres OMAR, un asistente de IA industrial especializado en ayudar operadores y mantenedores.
-Contexto de la sesión: {session_data.get('machine_context', 'No especificado')}"""
-    }]
-    if session_data.get('summary'):
-        messages.append({"role": "system", "content": f"Resumen: {session_data['summary']}"})
-    for turn in session_data['turns']:
-        messages.append({"role": "user", "content": turn['question']})
-        messages.append({"role": "assistant", "content": turn['answer']})
-    messages.append({"role": "user", "content": user_question})
-    return messages
+def get_or_create_session(k: str):
+    now = datetime.now(TZ)
+    s = sessions.get(k)
+    if not s:
+        s = {"greet_until": datetime.min.replace(tzinfo=TZ), "summary": "", "turns": [], "last_seen": now, "rate": deque()}
+        sessions[k] = s
+    else:
+        s["last_seen"] = now
+    return s
 
-def push_turn(session_data: Dict, question: str, answer: str):
-    session_data['turns'].append({
-        'question': question,
-        'answer': answer,
-        'timestamp': datetime.now()
-    })
-    session_data['last_interaction'] = datetime.now()
+def apply_rate_limit(s) -> bool:
+    # True si supera el rate y NO debe llamarse a OpenAI
+    now = datetime.now(TZ)
+    dq = s["rate"]
+    dq.append(now)
+    limite = now - timedelta(seconds=Conf.SESSION_RATE_LIMIT_SECONDS)
+    while dq and dq[0] < limite:
+        dq.popleft()
+    return len(dq) > 1  # más de 1 petición dentro de la ventana = corta
 
-def apply_rate_limit(session_data: Dict) -> bool:
-    now = datetime.now()
-    return (now - session_data['last_interaction']).seconds < 2
+def push_turn(s, user_text: str, assistant_text: str | None):
+    s["turns"].append({"u": user_text, "a": assistant_text})
+    if len(s["turns"]) > Conf.SESSION_MAX_TURNS:
+        s["turns"] = s["turns"][-Conf.SESSION_MAX_TURNS:]
 
-@app.before_request
-def _log_request_meta():
-    logger.info("REQ %s %s Ctype=%s", request.method, request.path, request.headers.get("Content-Type"))
+def build_messages(s, pregunta: str):
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if s["turns"]:
+        # Memoria corta: enviamos 2-4 turnos previos
+        for t in s["turns"][-Conf.SESSION_MAX_TURNS:]:
+            if t.get("u"): msgs.append({"role": "user", "content": t["u"]})
+            if t.get("a"): msgs.append({"role": "assistant", "content": t["a"]})
+    msgs.append({"role": "user", "content": pregunta})
+    return msgs
 
+# === Endpoints ===
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+    return jsonify({"ok": True, "mensaje": "Backend activo", "ahora": ahora_str()}), 200
 
-@app.route("/ask", methods=["POST", "OPTIONS"])
-def ask():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    try:
-        data = request.get_json(silent=True) or {}
-        pregunta = (data.get("pregunta") or "").strip()
-        session_id = (data.get("sessionId") or "").strip()
-        if not pregunta:
-            return jsonify({"respuesta": "", "imagenes": [], "error": "La pregunta está vacía"}), 400
-        if not session_id:
-            return jsonify({"respuesta": "", "imagenes": [], "error": "SessionId requerido"}), 400
-
-        session_data = get_or_create_session(session_id)
-        if apply_rate_limit(session_data):
-            return jsonify({"respuesta": "", "imagenes": [], "error": "Consulta muy rápida"}), 429
-
-        messages = build_messages(session_data, pregunta)
-
-        try:
-            if not _use_openai_legacy:
-                resp = _openai_client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS_OUT,
-                    timeout=OPENAI_TIMEOUT
-                )
-                answer = (resp.choices[0].message.content or "").strip()
-            else:
-                resp = openai.ChatCompletion.create(
-                    model=MODEL,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS_OUT,
-                    request_timeout=OPENAI_TIMEOUT
-                )
-                answer = (resp["choices"][0]["message"]["content"] or "").strip()
-        except (APITimeoutError, APIConnectionError) as e:
-            logger.warning(f"Timeout/Conn OpenAI: {e}")
-            return jsonify({"respuesta": "", "imagenes": [], "error": "La IA tardó demasiado en responder"}), 504
-        except RateLimitError as e:
-            logger.warning(f"RateLimit: {e}")
-            return jsonify({"respuesta": "", "imagenes": [], "error": "La IA está ocupada"}), 429
-
-        now = datetime.now()
-        if now > session_data['greet_until']:
-            if not answer.lower().startswith("hola, soy omar"):
-                answer = f"{SALUDO_INICIAL}\n\n{answer}"
-            session_data['greet_until'] = now + timedelta(minutes=GREETING_TTL_MIN)
-
-        push_turn(session_data, pregunta, answer)
-
-        return jsonify({"respuesta": answer, "imagenes": [], "error": None})
-    except Exception as e:
-        logger.exception("Error /ask")
-        return jsonify({"respuesta": "", "imagenes": [], "error": str(e)}), 500
-
-# Endpoint de entrenamiento de texto
-@app.route("/train/text", methods=["POST", "OPTIONS"])
-def train_text():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    try:
-        data = request.get_json(silent=True) or {}
-        nota = (data.get("nota") or "").strip()
-        
-        if not nota:
-            return jsonify({"status": "error", "message": "Nota requerida"}), 400
-        
-        # Aquí procesarías la nota para entrenar el modelo
-        # Por ahora solo confirmamos recepción
-        logger.info(f"Entrenamiento de texto recibido: {nota[:100]}...")
-        
-        return jsonify({
-            "status": "success", 
-            "message": "Texto recibido para entrenamiento",
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        logger.exception("Error /train/text")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# Endpoint de entrenamiento de imagen
-@app.route("/train/image", methods=["POST", "OPTIONS"])
-def train_image():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    try:
-        # Verificar si hay archivo
-        if 'imagen' not in request.files:
-            return jsonify({"status": "error", "message": "No se recibió imagen"}), 400
-        
-        file = request.files['imagen']
-        if file.filename == '':
-            return jsonify({"status": "error", "message": "Nombre de archivo vacío"}), 400
-        
-        # Aquí procesarías la imagen para entrenar el modelo
-        # Por ahora solo confirmamos recepción
-        logger.info(f"Entrenamiento de imagen recibido: {file.filename}")
-        
-        return jsonify({
-            "status": "success", 
-            "message": "Imagen recibida para entrenamiento",
-            "filename": file.filename,
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        logger.exception("Error /train/image")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# Endpoint de entrenamiento de audio
-@app.route("/train/audio", methods=["POST", "OPTIONS"])
-def train_audio():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    try:
-        # Verificar si hay archivo
-        if 'audio' not in request.files:
-            return jsonify({"status": "error", "message": "No se recibió audio"}), 400
-        
-        file = request.files['audio']
-        if file.filename == '':
-            return jsonify({"status": "error", "message": "Nombre de archivo vacío"}), 400
-        
-        # Aquí procesarías el audio para entrenar el modelo
-        # Por ahora solo confirmamos recepción
-        logger.info(f"Entrenamiento de audio recibido: {file.filename}")
-        
-        return jsonify({
-            "status": "success", 
-            "message": "Audio recibido para entrenamiento",
-            "filename": file.filename,
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        logger.exception("Error /train/audio")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# Endpoint de feedback
-@app.route("/feedback", methods=["POST", "OPTIONS"])
-def feedback():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    try:
-        data = request.get_json(silent=True) or {}
-        session_id = (data.get("sessionId") or "").strip()
-        feedback_text = (data.get("feedback") or "").strip()
-        rating = data.get("rating", 0)
-        
-        if not session_id:
-            return jsonify({"status": "error", "message": "SessionId requerido"}), 400
-        
-        # Aquí procesarías el feedback
-        logger.info(f"Feedback recibido - Session: {session_id}, Rating: {rating}, Text: {feedback_text[:100]}...")
-        
-        return jsonify({
-            "status": "success", 
-            "message": "Feedback recibido",
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        logger.exception("Error /feedback")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# Endpoint de estado del sistema
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify({
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "sessions_active": len(sessions),
-        "model": MODEL,
-        "openai_configured": bool(OPENAI_API_KEY)
-    })
-
-# Endpoint raíz
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({
-        "message": "OMAR Backend - IA Industrial",
-        "version": "1.0.0",
-        "endpoints": [
+        "puntos_finales": [
             "/ask - Chat con IA",
-            "/train/text - Entrenamiento de texto",
-            "/train/image - Entrenamiento de imagen", 
-            "/train/audio - Entrenamiento de audio",
-            "/feedback - Feedback del usuario",
+            "/reset - Reinicia memoria de sesión",
             "/status - Estado del sistema",
-            "/ping - Health check"
+            "/ping - Comprobación del estado"
         ],
-        "timestamp": datetime.now().isoformat()
-    })
+        "mensaje": "OMAR Backend - IA Industrial",
+        "marca_de_tiempo": ahora_str(),
+        "version": "1.0.0"
+    }), 200
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    data = request.get_json(silent=True) or {}
+    session_id = sanea(data.get("sessionId") or "")
+    k = key_sesion(session_id)
+    sessions.pop(k, None)
+    return jsonify({"ok": True, "mensaje": "Sesión reiniciada"}), 200
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    try:
+        data = request.get_json(silent=True) or {}
+        pregunta = sanea(data.get("pregunta") or "")
+        session_id = sanea(data.get("sessionId") or "")
+
+        if not pregunta:
+            return jsonify({"error": "La pregunta está vacía"}), 400
+
+        # Short-circuits (gratis, no gastan tokens)
+        if es_solo_saludo(pregunta):
+            return jsonify({"respuesta": SALUDO_INICIAL, "imagenes": []}), 200
+        if es_fecha_hora(pregunta):
+            return jsonify({"respuesta": f"Ahora es {ahora_str()} (America/Santiago).", "imagenes": []}), 200
+        if fuera_de_dominio(pregunta):
+            return jsonify({"respuesta": "No tengo esa info.", "imagenes": []}), 200
+
+        # Sesión + rate-limit
+        k = key_sesion(session_id)
+        s = get_or_create_session(k)
+        if apply_rate_limit(s):
+            # Sugiere esperar sin “matar” al usuario
+            return jsonify({"respuesta": "Estás consultando muy rápido. Prueba de nuevo en unos segundos.", "imagenes": []}), 429
+
+        # Construir mensajes con memoria corta
+        messages = build_messages(s, pregunta)
+
+        # Llamada a OpenAI
+        resp = client.chat.completions.create(
+            model=Conf.OPENAI_MODEL,
+            messages=messages,
+            temperature=Conf.OPENAI_TEMPERATURE,
+            max_tokens=Conf.OPENAI_MAX_TOKENS,
+        )
+        texto = (resp.choices[0].message.content or "").strip()
+
+        # Saludo solo si no saludamos hace un rato
+        now = datetime.now(TZ)
+        if now > s["greet_until"]:
+            if not texto.lower().startswith("hola, soy tu compañero de trabajo"):
+                texto = f"{SALUDO_INICIAL}\n\n{texto}"
+            s["greet_until"] = now + timedelta(minutes=Conf.SESSION_GREETING_TTL_MIN)
+
+        # Guardar turno en memoria corta
+        push_turn(s, pregunta, texto)
+
+        # Recorte por seguridad de transferencia
+        if len(texto) > 900:
+            texto = texto[:900] + "…"
+
+        return jsonify({"respuesta": texto, "imagenes": []}), 200
+
+    except Exception as e:
+        msg = str(e)
+        if "insufficient_quota" in msg:
+            return jsonify({"error": "Sin saldo de API. Revisa Billing de OpenAI."}), 502
+        return jsonify({"error": msg}), 500
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host=Conf.HOST, port=Conf.PORT)
